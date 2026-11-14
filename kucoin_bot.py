@@ -28,7 +28,7 @@ MAX_ALLOC = 0.5        # never put more than 50% of equity in one position
 FEE = 0.001            # 0.1% per side (check your actual tier)
 SLIPPAGE = 0.0005
 POLL_SEC = 60
-STATE_FILE = "state.json"
+STATE_FILE = {True: "state.json", False: "state_live.json"}   # keyed by paper; never share
 
 
 # ---------- API helpers ----------
@@ -58,9 +58,21 @@ def signed(method, endpoint, body=None):
     return j["data"]
 
 
+TF_SEC = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1hour": 3600,
+          "4hour": 14400, "1day": 86400}
+
+
 def get_candles(symbol, tf, n=300):
-    # rows: [time, open, close, high, low, volume, turnover], newest first
-    rows = pub("/api/v1/market/candles", {"symbol": symbol, "type": tf})
+    # rows: [time, open, close, high, low, volume, turnover], newest first.
+    # Without startAt/endAt KuCoin returns only ~100 rows; page back 1500 at a time.
+    step, end, rows = TF_SEC[tf], int(time.time()), []
+    while len(rows) < n:
+        page = pub("/api/v1/market/candles", {"symbol": symbol, "type": tf,
+                                               "startAt": end - step * 1500, "endAt": end})
+        if not page:
+            break
+        rows += page
+        end = int(page[-1][0]) - 1
     rows = rows[:n][::-1]
     return [dict(t=int(r[0]), o=float(r[1]), c=float(r[2]), h=float(r[3]), l=float(r[4])) for r in rows]
 
@@ -129,35 +141,48 @@ def backtest():
 
 
 # ---------- live / paper ----------
-def load():
-    if os.path.exists(STATE_FILE):
-        return json.load(open(STATE_FILE))
+def load(paper):
+    if os.path.exists(STATE_FILE[paper]):
+        return json.load(open(STATE_FILE[paper]))
     return dict(pos=None, last_bar=0, paper_usdt=1000.0)
 
 
-def save(st):
-    json.dump(st, open(STATE_FILE, "w"))
+def save(st, paper):
+    json.dump(st, open(STATE_FILE[paper], "w"))
 
 
-def usdt_balance():
+def balance(currency):
     # Order endpoint below is the high-frequency (trade_hf) spot account.
-    rows = signed("GET", "/api/v1/accounts?currency=USDT&type=trade_hf")
+    rows = signed("GET", f"/api/v1/accounts?currency={currency}&type=trade_hf")
     return float(rows[0]["available"]) if rows else 0.0
 
 
+def base_increment():
+    return float(pub(f"/api/v2/symbols/{SYMBOL}")["baseIncrement"])
+
+
 def market_order(side, qty, price, paper):
+    """Place a market order; return the base quantity actually traded."""
     if paper:
-        return
+        return qty
     body = {"clientOid": uuid.uuid4().hex, "symbol": SYMBOL, "type": "market", "side": side}
     if side == "buy":
         body["funds"] = f"{qty * price:.2f}"
     else:
-        body["size"] = f"{int(qty * 1e6) / 1e6:.6f}"  # check baseIncrement via symbol endpoint
-    print("ORDER", signed("POST", "/api/v1/hf/orders", body))
+        # Fees can leave us holding slightly less than recorded; never sell more than we have.
+        qty = min(qty, balance(SYMBOL.split("-")[0]))
+        inc = base_increment()
+        qty = int(qty / inc) * inc
+        body["size"] = f"{qty:.8f}"
+    res = signed("POST", "/api/v1/hf/orders", body)
+    print("ORDER", res)
+    time.sleep(1)                                       # let the market order settle
+    fill = signed("GET", f"/api/v1/hf/orders/{res['orderId']}?symbol={SYMBOL}")
+    return float(fill["dealSize"])
 
 
 def run(paper=True):
-    st = load()
+    st = load(paper)
     print(f"{'PAPER' if paper else 'LIVE'} mode | {SYMBOL} {TF}")
     while True:
         try:
@@ -176,9 +201,9 @@ def run(paper=True):
                 pos = st["pos"]
                 if sig == "buy" and not pos:
                     stop = px - ATR_MULT * atr(bars, ATR_N)
-                    equity = st["paper_usdt"] if paper else usdt_balance()
+                    equity = st["paper_usdt"] if paper else balance("USDT")
                     qty = position_size(equity, px, stop)
-                    market_order("buy", qty, px, paper)
+                    qty = market_order("buy", qty, px, paper)
                     st["paper_usdt"] -= qty * px * (1 + FEE)
                     st["pos"] = dict(qty=qty, entry=px, stop=stop)
                     print(f"BUY {qty:.6f} @ {px} stop {stop:.2f}")
@@ -186,7 +211,7 @@ def run(paper=True):
                     market_order("sell", pos["qty"], px, paper)
                     st["paper_usdt"] += pos["qty"] * px * (1 - FEE); st["pos"] = None
                     print(f"SELL @ {px}")
-            save(st)
+            save(st, paper)
         except Exception as e:
             print("error:", e)                                  # never crash-loop silently
         time.sleep(POLL_SEC)
