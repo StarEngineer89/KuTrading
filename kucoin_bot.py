@@ -19,8 +19,8 @@ import os, sys, time, hmac, hashlib, base64, json, uuid
 import requests
 
 BASE = "https://api.kucoin.com"
-SYMBOL = "BTC-USDT"
-TF = "1hour"
+SYMBOL = "SOL-USDT"
+TF = "4hour"
 FAST, SLOW, ATR_N = 20, 50, 14
 ATR_MULT = 2.0
 RISK_PCT = 0.01        # risk 1% of equity per trade
