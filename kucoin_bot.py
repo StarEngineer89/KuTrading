@@ -14,16 +14,20 @@ Modes:
 
 Env vars for live: KC_KEY, KC_SECRET, KC_PASSPHRASE (key version 2 assumed)
 Use an API key with Spot trade permission ONLY (no withdrawal), IP-restricted.
+Live mode assumes the bot owns all of the base coin in the account: it uses the
+coin balance to tell whether the exchange stop-loss has filled.
 """
 import os, sys, time, hmac, hashlib, base64, json, uuid
+from decimal import Decimal, ROUND_DOWN
+from functools import lru_cache
 import requests
 
 BASE = "https://api.kucoin.com"
 SYMBOL = "SOL-USDT"
 TF = "4hour"
-FAST, SLOW, ATR_N = 20, 50, 14
+FAST, SLOW, ATR_N = 30, 80, 14
 ATR_MULT = 2.0
-RISK_PCT = 0.01        # risk 1% of equity per trade
+RISK_PCT = 0.02        # risk 2% of equity per trade
 MAX_ALLOC = 0.5        # never put more than 50% of equity in one position
 FEE = 0.001            # 0.1% per side (check your actual tier)
 SLIPPAGE = 0.0005
@@ -151,14 +155,29 @@ def save(st, paper):
     json.dump(st, open(STATE_FILE[paper], "w"))
 
 
-def balance(currency):
+BASE_CCY = SYMBOL.split("-")[0]
+
+
+def balance(currency, field="available"):
     # Order endpoint below is the high-frequency (trade_hf) spot account.
+    # field "balance" also counts coins held by open orders, e.g. our stop-loss.
     rows = signed("GET", f"/api/v1/accounts?currency={currency}&type=trade_hf")
-    return float(rows[0]["available"]) if rows else 0.0
+    return float(rows[0][field]) if rows else 0.0
 
 
-def base_increment():
-    return float(pub(f"/api/v2/symbols/{SYMBOL}")["baseIncrement"])
+@lru_cache(maxsize=None)
+def symbol_info():
+    return pub(f"/api/v2/symbols/{SYMBOL}")
+
+
+def to_inc(x, inc):
+    """Round x down to a multiple of the exchange increment string `inc`, formatted for the API."""
+    return format((Decimal(str(x)) / Decimal(inc)).to_integral_value(ROUND_DOWN) * Decimal(inc), "f")
+
+
+def holding():
+    """Whether the account still holds a sellable amount of the base coin."""
+    return balance(BASE_CCY, "balance") >= float(symbol_info()["baseMinSize"])
 
 
 def market_order(side, qty, price, paper):
@@ -170,15 +189,57 @@ def market_order(side, qty, price, paper):
         body["funds"] = f"{qty * price:.2f}"
     else:
         # Fees can leave us holding slightly less than recorded; never sell more than we have.
-        qty = min(qty, balance(SYMBOL.split("-")[0]))
-        inc = base_increment()
-        qty = int(qty / inc) * inc
-        body["size"] = f"{qty:.8f}"
+        size = to_inc(min(qty, balance(BASE_CCY)), symbol_info()["baseIncrement"])
+        if float(size) == 0:
+            return 0.0
+        body["size"] = size
+    before = balance(BASE_CCY, "balance")
     res = signed("POST", "/api/v1/hf/orders", body)
     print("ORDER", res)
-    time.sleep(1)                                       # let the market order settle
-    fill = signed("GET", f"/api/v1/hf/orders/{res['orderId']}?symbol={SYMBOL}")
-    return float(fill["dealSize"])
+    # The order is in: never raise from here on, or the caller loses track of the coins.
+    for _ in range(5):
+        time.sleep(1)                                   # let the market order settle
+        try:
+            return float(signed("GET", f"/api/v1/hf/orders/{res['orderId']}?symbol={SYMBOL}")["dealSize"])
+        except Exception as e:
+            print("fill check failed:", e)
+    try:
+        return abs(balance(BASE_CCY, "balance") - before)
+    except Exception as e:
+        print("balance check failed, assuming a full fill:", e)
+        return qty
+
+
+def place_stop(stop):
+    """Cover any free base coin with a market stop-loss sell on the exchange."""
+    info = symbol_info()
+    size = to_inc(balance(BASE_CCY), info["baseIncrement"])
+    if float(size) < float(info["baseMinSize"]):
+        return                                          # nothing free: already covered
+    body = {"clientOid": uuid.uuid4().hex, "symbol": SYMBOL, "side": "sell", "type": "market",
+            "stop": "loss", "stopPrice": to_inc(stop, info["priceIncrement"]), "size": size}
+    print("STOP ORDER", signed("POST", "/api/v1/stop-order", body))
+
+
+def cancel_stops():
+    try:
+        signed("DELETE", f"/api/v1/stop-order/cancel?symbol={SYMBOL}")
+    except Exception as e:
+        print("stop cancel failed:", e)
+    time.sleep(1)                                       # let the held coins free up
+
+
+def exit_position(st, px, paper, why):
+    pos = st["pos"]
+    pos["exiting"] = why                                # retried every poll until done
+    if not paper:
+        cancel_stops()
+        market_order("sell", pos["qty"], px, paper)
+        if holding():
+            print(f"{why} exit incomplete; retrying next poll")
+            return
+    st["paper_usdt"] += pos["qty"] * px * (1 - FEE); st["pos"] = None
+    print(f"{why} exit @ {px}")
 
 
 def run(paper=True):
@@ -190,10 +251,13 @@ def run(paper=True):
             bars = get_candles(SYMBOL, TF, 300)[:-1]          # drop the still-forming candle
             pos = st["pos"]
 
-            if pos and px <= pos["stop"]:
-                market_order("sell", pos["qty"], px, paper)
-                st["paper_usdt"] += pos["qty"] * px * (1 - FEE); st["pos"] = None
-                print(f"STOP exit @ {px}")
+            if pos and not paper and not pos.get("exiting") and not holding():
+                st["pos"] = None
+                print("exchange stop-loss filled; position closed")
+            elif pos and (pos.get("exiting") or px <= pos["stop"]):
+                exit_position(st, px, paper, pos.get("exiting") or "STOP")
+            elif pos and not paper:
+                place_stop(pos["stop"])                         # no-op while already covered
 
             if bars[-1]["t"] != st["last_bar"]:                 # new closed candle
                 st["last_bar"] = bars[-1]["t"]
@@ -206,14 +270,16 @@ def run(paper=True):
                     qty = market_order("buy", qty, px, paper)
                     st["paper_usdt"] -= qty * px * (1 + FEE)
                     st["pos"] = dict(qty=qty, entry=px, stop=stop)
+                    save(st, paper)                             # record the coins before anything can fail
                     print(f"BUY {qty:.6f} @ {px} stop {stop:.2f}")
-                elif sig == "sell" and pos:
-                    market_order("sell", pos["qty"], px, paper)
-                    st["paper_usdt"] += pos["qty"] * px * (1 - FEE); st["pos"] = None
-                    print(f"SELL @ {px}")
-            save(st, paper)
+                    if not paper:
+                        place_stop(stop)
+                elif sig == "sell" and pos and not pos.get("exiting"):
+                    exit_position(st, px, paper, "SELL")
         except Exception as e:
             print("error:", e)                                  # never crash-loop silently
+        finally:
+            save(st, paper)
         time.sleep(POLL_SEC)
 
 
