@@ -12,7 +12,8 @@ Modes:
   python kucoin_bot.py paper      # live prices, simulated fills (default for run)
   python kucoin_bot.py live       # REAL orders; needs env vars + DRY_RUN=0
 
-Env vars for live: KC_KEY, KC_SECRET, KC_PASSPHRASE (key version 2 assumed)
+Env vars for live: KC_KEY, KC_SECRET, KC_PASSPHRASE (key version 2 assumed),
+read from the environment or from a .env file next to this script.
 Use an API key with Spot trade permission ONLY (no withdrawal), IP-restricted.
 Live mode assumes the bot owns all of the base coin in the account: it uses the
 coin balance to tell whether the exchange stop-loss has filled.
@@ -22,7 +23,22 @@ from decimal import Decimal, ROUND_DOWN
 from functools import lru_cache
 import requests
 
-BASE = "https://api.kucoin.com"
+
+def load_dotenv(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+    # Minimal .env reader: KEY=value lines; real environment variables take precedence.
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_dotenv()
+
+BASE ="https://api.kucoin.com"
 SYMBOL = "SOL-USDT"
 TF = "4hour"
 FAST, SLOW, ATR_N = 30, 80, 14
@@ -159,9 +175,9 @@ BASE_CCY = SYMBOL.split("-")[0]
 
 
 def balance(currency, field="available"):
-    # Order endpoint below is the high-frequency (trade_hf) spot account.
+    # Classic (non-HF) spot account: the one /api/v1/orders and /api/v1/stop-order trade from.
     # field "balance" also counts coins held by open orders, e.g. our stop-loss.
-    rows = signed("GET", f"/api/v1/accounts?currency={currency}&type=trade_hf")
+    rows = signed("GET", f"/api/v1/accounts?currency={currency}&type=trade")
     return float(rows[0][field]) if rows else 0.0
 
 
@@ -194,13 +210,15 @@ def market_order(side, qty, price, paper):
             return 0.0
         body["size"] = size
     before = balance(BASE_CCY, "balance")
-    res = signed("POST", "/api/v1/hf/orders", body)
+    res = signed("POST", "/api/v1/orders", body)
     print("ORDER", res)
     # The order is in: never raise from here on, or the caller loses track of the coins.
     for _ in range(5):
         time.sleep(1)                                   # let the market order settle
         try:
-            return float(signed("GET", f"/api/v1/hf/orders/{res['orderId']}?symbol={SYMBOL}")["dealSize"])
+            fill = signed("GET", f"/api/v1/orders/{res['orderId']}")
+            if not fill["isActive"]:
+                return float(fill["dealSize"])
         except Exception as e:
             print("fill check failed:", e)
     try:
@@ -216,8 +234,9 @@ def place_stop(stop):
     size = to_inc(balance(BASE_CCY), info["baseIncrement"])
     if float(size) < float(info["baseMinSize"]):
         return                                          # nothing free: already covered
+    # A sell with stopPrice below the market triggers on the way down; there is no loss/entry flag.
     body = {"clientOid": uuid.uuid4().hex, "symbol": SYMBOL, "side": "sell", "type": "market",
-            "stop": "loss", "stopPrice": to_inc(stop, info["priceIncrement"]), "size": size}
+            "stopPrice": to_inc(stop, info["priceIncrement"]), "size": size, "tradeType": "TRADE"}
     print("STOP ORDER", signed("POST", "/api/v1/stop-order", body))
 
 
