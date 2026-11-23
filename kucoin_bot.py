@@ -51,6 +51,10 @@ POLL_SEC = 60
 STATE_FILE = {True: "state.json", False: "state_live.json"}   # keyed by paper; never share
 
 
+def log(*args):
+    print(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), *args, flush=True)
+
+
 # ---------- API helpers ----------
 def pub(path, params=None):
     r = requests.get(BASE + path, params=params, timeout=10)
@@ -211,7 +215,7 @@ def market_order(side, qty, price, paper):
         body["size"] = size
     before = balance(BASE_CCY, "balance")
     res = signed("POST", "/api/v1/orders", body)
-    print("ORDER", res)
+    log("ORDER", res)
     # The order is in: never raise from here on, or the caller loses track of the coins.
     for _ in range(5):
         time.sleep(1)                                   # let the market order settle
@@ -220,11 +224,11 @@ def market_order(side, qty, price, paper):
             if not fill["isActive"]:
                 return float(fill["dealSize"])
         except Exception as e:
-            print("fill check failed:", e)
+            log("fill check failed:", e)
     try:
         return abs(balance(BASE_CCY, "balance") - before)
     except Exception as e:
-        print("balance check failed, assuming a full fill:", e)
+        log("balance check failed, assuming a full fill:", e)
         return qty
 
 
@@ -237,14 +241,14 @@ def place_stop(stop):
     # A sell with stopPrice below the market triggers on the way down; there is no loss/entry flag.
     body = {"clientOid": uuid.uuid4().hex, "symbol": SYMBOL, "side": "sell", "type": "market",
             "stopPrice": to_inc(stop, info["priceIncrement"]), "size": size, "tradeType": "TRADE"}
-    print("STOP ORDER", signed("POST", "/api/v1/stop-order", body))
+    log("STOP ORDER", signed("POST", "/api/v1/stop-order", body))
 
 
 def cancel_stops():
     try:
         signed("DELETE", f"/api/v1/stop-order/cancel?symbol={SYMBOL}")
     except Exception as e:
-        print("stop cancel failed:", e)
+        log("stop cancel failed:", e)
     time.sleep(1)                                       # let the held coins free up
 
 
@@ -255,15 +259,15 @@ def exit_position(st, px, paper, why):
         cancel_stops()
         market_order("sell", pos["qty"], px, paper)
         if holding():
-            print(f"{why} exit incomplete; retrying next poll")
+            log(f"{why} exit incomplete; retrying next poll")
             return
     st["paper_usdt"] += pos["qty"] * px * (1 - FEE); st["pos"] = None
-    print(f"{why} exit @ {px}")
+    log(f"{why} exit @ {px}")
 
 
 def run(paper=True):
     st = load(paper)
-    print(f"{'PAPER' if paper else 'LIVE'} mode | {SYMBOL} {TF}")
+    log(f"{'PAPER' if paper else 'LIVE'} mode | {SYMBOL} {TF}")
     while True:
         try:
             px = last_price(SYMBOL)
@@ -272,7 +276,7 @@ def run(paper=True):
 
             if pos and not paper and not pos.get("exiting") and not holding():
                 st["pos"] = None
-                print("exchange stop-loss filled; position closed")
+                log("exchange stop-loss filled; position closed")
             elif pos and (pos.get("exiting") or px <= pos["stop"]):
                 exit_position(st, px, paper, pos.get("exiting") or "STOP")
             elif pos and not paper:
@@ -290,13 +294,13 @@ def run(paper=True):
                     st["paper_usdt"] -= qty * px * (1 + FEE)
                     st["pos"] = dict(qty=qty, entry=px, stop=stop)
                     save(st, paper)                             # record the coins before anything can fail
-                    print(f"BUY {qty:.6f} @ {px} stop {stop:.2f}")
+                    log(f"BUY {qty:.6f} @ {px} stop {stop:.2f}")
                     if not paper:
                         place_stop(stop)
                 elif sig == "sell" and pos and not pos.get("exiting"):
                     exit_position(st, px, paper, "SELL")
         except Exception as e:
-            print("error:", e)                                  # never crash-loop silently
+            log("error:", e)                                  # never crash-loop silently
         finally:
             save(st, paper)
         time.sleep(POLL_SEC)
